@@ -1,0 +1,326 @@
+---
+title: "DESeq2 Differential Expression Analysis"
+author: "Michael de Kok"
+date: "Feb 22nd, 2023"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 2
+    toc_float: TRUE
+    theme: united
+    css: style.css
+    version: 1.4
+---
+
+Based on this Vignette:
+http://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+Read there for more annotation, context and help!
+
+```{r packages, include=FALSE, warning=FALSE}
+library(knitr)
+library(readr)
+library(readxl)
+library(writexl)
+library(xlsx)
+library(tibble)
+library(RNAseqQC)
+library(DESeq2)
+library(biomaRt)
+library(Hmisc)
+library(ggplot2)
+library(EnhancedVolcano)
+library(ggvenn)
+library(gplots)
+```
+
+# Data Input and Wrangling
+
+## Read and Wrangle Annotation
+
+```{r annotation}
+# Read annotation
+annotation <- readxl::read_xlsx(path = "metadata table.xlsx", col_names = T)
+annotation <- column_to_rownames(.data = annotation, var = "sample_name")
+
+# Sort Rows by Sample Names, Alphabetically
+annotation <- annotation[order(row.names(annotation)), ]
+
+# Define Factors
+annotation$donor <- factor(annotation$donor, levels=c(1:4), labels=c("A", "B", "C", "D"))
+annotation$tlr <- factor(annotation$tlr)
+annotation$dendrimer <- relevel(factor(annotation$dendrimer), ref="control")
+```
+
+## Read and Wrangle Counts
+
+```{r counts, message=FALSE} 
+# Read counts (direct output from featureCounts)
+counts <- as.data.frame(read_table(file = "results/counttable.txt",skip = 1))
+
+# Simplify the column names to be samples only, with no preceding path
+colnames(counts) <- basename(sub(x = colnames(counts), pattern = ".sorted.bam", replacement = ""))
+
+# Set ENSEMBL ID's as Rownames
+counts <- column_to_rownames(.data = counts, var = "Geneid")
+
+# Genes
+genes <- counts[1:5]
+counts <- counts[-c(1:5)]
+
+# Sort Colums by Sample Names, Alphabetically
+counts <- counts[, sort(colnames(counts))]
+```
+
+## Using BioMart, create a EnsemblID-to-GeneName Lookup Table
+
+```{r biomart}
+listEnsembl()
+ensembl <- useEnsembl(biomart = "genes")
+datasets <- listDatasets(ensembl)
+head(datasets)
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+gene_lookup_table <- getBM(attributes = c('ensembl_gene_id','hgnc_symbol'), mart = ensembl)
+gene_lookup_table <- gene_lookup_table[order(gene_lookup_table$ensembl_gene_id),]
+gene_lookup_table <- remove_rownames(gene_lookup_table)
+gene_lookup_table$ensembl_gene_id <- make.unique(gene_lookup_table$ensembl_gene_id)
+gene_lookup_table <- column_to_rownames(gene_lookup_table, "ensembl_gene_id")
+```
+
+## Do Final Checks and make DESeqObject
+
+```{r deseqobjects}
+# Check if Colnames of Counts exactly match Rownames of Annotation
+stopifnot(all(colnames(counts) == rownames(annotation)))
+
+# Make the DESeq2 Objects with the correct Design Formula
+dds_full <- DESeqDataSetFromMatrix(countData = counts,
+                              colData = annotation,
+                              design = ~donor+tlr+dendrimer)
+```
+
+# Filtering 
+
+## Filtering Samples
+
+```{r qc_samples}
+# No Technical Replicates = No Sample QC = No basis to filter samples out
+```
+
+## Filtering Genes
+
+Before continuing, a useful intermediate step is to remove genes with low counts. This often substantially reduces the total number of genes, and thus the overall size of the data set and computation time. A good strategy is to determine the size of a biological group, i.e. all samples under the same biological condition, and filter (keep) genes with a certain count at least as often as the size of the biological group. In our case, each group is a combination of treatment and mutation status with 4 samples and we choose 5 counts as threshold.
+
+```{r qc_genes}
+dds_full    <- filter_genes(dds_full, min_count = 5, min_rep = 6)
+```
+
+# Run specific SESeq Comparisons
+
+First we set up empty lists to store our results.
+
+```{r make_lists}
+dds <- list() # Empty list of DDS Objects
+res <- list() # Empty list of results
+```
+
+Next we load a special table prepared in advance with all the comparisons we want to do:
+
+```{r load_comparisons}
+comparisons <- as.data.frame(readxl::read_xlsx(path = "Comparisons.xlsx", skip = 8))
+comparisons <- comparisons[!(rowSums(is.na(comparisons)) == dim(comparisons)[2]),]
+rownames(comparisons) <- comparisons$Comparison_ID
+```
+
+Lastly, we loop through the rows of the comparisons table and use the right columns as parameters to do the comparisons quickly and efficiently in a single FOR loop.
+
+```{r deseq2_comparisons, results='asis', message=FALSE}
+dds <- list()
+res <- list()
+volcanoplots <- list()
+for (comparison in rownames(comparisons)) {try({
+  # Print Subchapter for report
+  #cat("## Comparison:", comparison)
+  dds[[comparison]] <- dds_full
+  # Set the correct shared parameter and contrasting parameters 
+  Same_Parameter <- comparisons[comparison, "Same_Parameter"]
+  Same_Parameter_Value <- comparisons[comparison, "Same_Value"]
+  Col_Num <- which(colnames(dds[[comparison]]@colData) == Same_Parameter)
+  dds[[comparison]] <- dds[[comparison]][,dds[[comparison]]@colData[,Col_Num] == Same_Parameter_Value]
+  contrast <- unlist(comparisons[comparison, c(5,6,7)])
+  if (contrast[1] == "tlr")  {design(dds[[comparison]]) <- formula(~ tlr+donor)}
+  if (contrast[1] == "dendrimer") {design(dds[[comparison]]) <- formula(~ dendrimer+donor)}
+  
+  ## Run DESeq2 Analysis
+  dds[[comparison]] <- DESeq(dds[[comparison]])
+  res[[comparison]] <- as.data.frame(results(dds[[comparison]], contrast = contrast))
+  
+  ## Convert ENSEMBL ID to Gene Short Names
+  res[[comparison]]$GeneName <- gene_lookup_table[rownames(res[[comparison]]),"hgnc_symbol"]
+  
+  ## Sort diffexp table by P-Value
+  res[[comparison]] <- res[[comparison]][order(res[[comparison]]$pvalue),]
+  
+  ## Save resulting table to file
+  file_path <- paste("results/DESeq2 Differential Expression Tables/", comparison, ".xlsx", sep = "")
+  write.xlsx(x = res[[comparison]], file = file_path, col.names = TRUE, row.names = TRUE)
+  
+  ## Print top 10 Significant Genes from the Result Table to Report
+  cat("## Comparison:", comparison, 
+      "\nSimilar Condition:", Same_Parameter, "=", Same_Parameter_Value,
+      "\nContrasting Condition:", contrast[1], "(", contrast[2], "V.S.", contrast[3], ")\n")
+  print(knitr::kable(head(res[[comparison]], 10)))
+  cat("\n")
+  
+  ## Print and save volcano plot
+  volcanoplots[[comparison]] <- EnhancedVolcano(toptable = res[[comparison]],
+                                                  lab = res[[comparison]]$GeneName, 
+                                                  title = comparison, 
+                                                  x = 'log2FoldChange', 
+                                                  y = 'padj', 
+                                                  pCutoff = 0.05,
+                                                  FCcutoff = 1, 
+                                                  xlab = "Log2FC", 
+                                                  ylab = "-log10(Padj)",
+                                                  pointSize = 2.0,
+                                                  labSize = 4.0,
+                                                  labCol = 'black',
+                                                  labFace = 'bold',
+                                                  boxedLabels = TRUE,
+                                                  colAlpha = 4/5,
+                                                  legendPosition = 'right',
+                                                  legendLabSize = 14,
+                                                  legendIconSize = 4.0,
+                                                  drawConnectors = TRUE,
+                                                  widthConnectors = 1.0,
+                                                  colConnectors = 'black')
+    
+    tiff(filename = paste("results/DESeq2 Differential Expression Tables/Volcano_",
+                         comparison, ".tif", sep = ""),
+        width = 900, height = 700, units = "px")
+    print(volcanoplots[[comparison]])
+    invisible(dev.off())
+    volcanoplots[[comparison]]
+  
+  ## Collect garbage to prevent out of memory errors
+  gc(verbose = FALSE)
+})}
+```
+
+# Export Normalized Counts
+
+```{r deseq2_normalized_counts}
+# Estimate Size Factors
+dds_full    <- estimateSizeFactors(dds_full)
+
+# Print Size Factors per Tissue
+sizeFactors(dds_full)
+
+# Get Normalized Count Table
+normalizedcounts<- as.data.frame(counts(dds_full, normalized=TRUE))
+
+# Convert ENSEMBL Gene IDs to Gene Names
+genes_df <- as.vector(gene_lookup_table[rownames(normalizedcounts),"hgnc_symbol"])
+
+# Add Gene Names as First Column to Table
+normalizedcounts <- data.frame("GeneName" = genes_df, normalizedcounts)
+
+# Sort rows by Ensembl ID
+normalizedcounts <- normalizedcounts[order(row.names(normalizedcounts)), ]
+
+# Add ENSEMBL ID's back to the Normalized Count Table because write_xlsx doesn't include rownames
+normalizedcounts <- rownames_to_column(.data = normalizedcounts, var = "ENSEMBL_ID")
+
+# Save Normalized Count Tables
+write_xlsx(x = normalizedcounts, col_names = TRUE, path = "results/Normalized_CountTable.xlsx")
+```
+
+# Filter out significantly expressed gene with low cell count
+
+```{r, significant_genes}
+# Filter differentially expressed genes
+pam_galnac <- readxl::read_xlsx(path = "results/DESeq2 Differential Expression Tables/pam_control-galnac.xlsx")
+pam_galnac_sign <- subset(pam_galnac, pam_galnac$padj < 0.05 & pam_galnac$baseMean > 6)
+
+
+# Filter differentially expressed genes
+pam_forss <- readxl::read_xlsx(path = "results/DESeq2 Differential Expression Tables/pam_control-forssman.xlsx")
+pam_forss_sign <- subset(pam_forss, pam_forss$padj < 0.05 & pam_forss$baseMean > 6)
+
+
+# Filter differentially expressed genes
+pam_bga <- readxl::read_xlsx(path = "results/DESeq2 Differential Expression Tables/pam_control-bga.xlsx")
+pam_bga_sign <- subset(pam_bga, pam_bga$padj < 0.05 & pam_bga$baseMean > 6)
+
+
+# Filter differentially expressed genes
+pam_agm2 <- readxl::read_xlsx(path = "results/DESeq2 Differential Expression Tables/pam_control-agm2.xlsx")
+pam_agm2_sign <- subset(pam_agm2, pam_agm2$padj < 0.05 & pam_agm2$baseMean > 6)
+
+
+# Filter differentially expressed genes
+pam_gm2 <- readxl::read_xlsx(path = "results/DESeq2 Differential Expression Tables/pam_control-gm2.xlsx")
+pam_gm2_sign <- subset(pam_gm2, pam_gm2$padj < 0.05 & pam_gm2$baseMean > 6)
+```
+
+# Create Venn diagrams
+
+Shows overlap between differentially expressed genes detected for different dendrimers. 
+
+```{r venn_diagrams, message=FALSE, warning=FALSE}
+x <- list(
+  Forssman = pam_forss_sign$GeneName, 
+  GalNAc = pam_galnac_sign$GeneName, 
+  BGA = pam_bga_sign$GeneName
+)
+
+y <- list(
+  Forssman = pam_forss_sign$GeneName, 
+  aGM2 = pam_agm2_sign$GeneName, 
+  GM2 = pam_gm2_sign$GeneName
+)
+
+ggvenn(
+  x, 
+  fill_color = c("#0303C0", "#EFC000FF", "#CE3636"),
+  stroke_size = 0.5, set_name_size = 5, text_size = 4
+  )
+ggvenn(
+  y, 
+  fill_color = c("#0202C0", "#EFC000FF", "#CE3636"),
+  stroke_size = 0.5, set_name_size = 5, text_size = 4
+  )
+
+venn1 <- venn(x)
+list.venn1 <- print(venn1)
+write.table(list.venn1,file="results/Venn Forss GalNAc BGA.txt",sep="\t")
+
+venn2 <- venn(y)
+list.venn2 <- print(venn2)
+write.table(list.venn2,file="results/Venn Forss aGM2 GM2.txt",sep="\t")
+```
+
+# Plotting individual genes
+
+```{r individual_genes}
+# Create gene lookup table with ensemble_gene_id
+gene_lookup_table <- rownames_to_column(.data = gene_lookup_table, var = "ensembl_gene_id")
+
+# Select & plot gene of interest
+gene = gene_lookup_table[gene_lookup_table$hgnc_symbol == "PVR", ]
+plot_count <- plotCounts(dds_full, gene = gene$ensembl_gene_id, intgroup = c('tlr', 'dendrimer', "donor"), returnData=TRUE)
+ggplot(plot_count, aes(x=dendrimer, y=count, color=donor)) +
+  geom_point(position=position_jitter(w=0.1, h=0)) +
+  facet_grid(cols = vars(tlr)) +
+  theme_bw() +
+  labs(x = "Dendrimer", y = "Normalised counts")
+```
+
+# Save Workspace and Session Info
+
+```{r workspace}
+save.image(file = "R Workspace.RData")
+```
+
+```{r sessioninfo}
+sessionInfo()
+```
